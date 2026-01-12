@@ -32,8 +32,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: TBD
 
 Plans:
-- [ ] 01-01: Shapefile loading and graph construction
-- [ ] 01-02: Spatial indexing and graph validation
+- [x] 01-01: Shapefile loading and region selection
+- [ ] 01-02: Graph construction and validation
 
 ### Phase 2: Location Integration
 **Goal**: Load SQLite location data, snap each point to nearest road edge, generate test subsets of 100/500/1000+ terminals
@@ -97,7 +97,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Data Foundation | 0/2 | Not started | - |
+| 1. Data Foundation | 1/2 | In progress | - |
 | 2. Location Integration | 0/2 | Not started | - |
 | 3. Algorithm Research | 0/2 | Not started | - |
 | 4. Classic Algorithms | 0/3 | Not started | - |
