@@ -23,6 +23,8 @@ key-files:
     - src/__init__.py
     - src/data/__init__.py
     - src/data/loader.py
+    - src/data/subset_generator.py
+    - data/subsets/roads/*.gpkg
 
 key-decisions:
   - "Use EPSG:4269 (NAD83) as native CRS from shapefiles"
@@ -57,21 +59,25 @@ completed: 2026-01-12
 - Installed core dependencies: geopandas, shapely, networkx, rtree, pyproj
 - Implemented RoadNetworkLoader with three region selection methods
 - Verified loader works with Albany, NY test region (3,951 roads in small bbox)
+- Generated 5 reusable road network subsets (xs/s/m/l/xl) saved as GeoPackage
 
 ## Task Commits
 
 Each task was committed atomically:
 
 1. **Task 1: Create project structure and dependencies** - `98d0541` (chore)
+2. **Task 2: Subset generation** - `b95ed45` (feat)
 
-Note: Task 2 implementation was included in Task 1 commit as the loader.py was created with full implementation.
+Note: Task 2's loader implementation was included in Task 1 commit. Subset generation added as follow-up.
 
 ## Files Created/Modified
 
 - `requirements.txt` - Core Python dependencies for GIS processing
 - `src/__init__.py` - Package root with project description
-- `src/data/__init__.py` - Data subpackage exposing RoadNetworkLoader
+- `src/data/__init__.py` - Data subpackage exposing RoadNetworkLoader, SubsetGenerator
 - `src/data/loader.py` - RoadNetworkLoader class with region selection
+- `src/data/subset_generator.py` - SubsetGenerator for creating reusable road subsets
+- `data/subsets/roads/*.gpkg` - 5 pre-generated road network subsets
 
 ## Decisions Made
 
