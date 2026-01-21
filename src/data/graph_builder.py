@@ -1,4 +1,53 @@
-"""Graph construction from road geometries with correct topology."""
+"""
+Graph construction from road geometries with correct topology.
+
+=== GRAPH CONSTRUCTION PROCESS ===
+
+The GraphBuilder converts road network geometries (LineStrings) into a NetworkX
+graph suitable for Steiner tree algorithms.
+
+Input:  GeoDataFrame with LineString/MultiLineString geometries
+Output: NetworkX Graph with:
+        - Nodes: road intersections and endpoints
+        - Edges: road segments with distance weights (meters)
+
+=== CONSTRUCTION PHASES ===
+
+Phase 1: Vertex Collection
+    - Extract all coordinates from all LineStrings
+    - Round coordinates to configured precision (default 6 decimals ~ 0.1m)
+    - Count how many times each vertex appears
+
+Phase 2: Node Identification
+    - Endpoints of LineStrings → always become nodes
+    - Interior vertices appearing in multiple LineStrings → intersection nodes
+    - This ensures the graph captures road topology correctly
+
+Phase 3: Coordinate Snapping
+    - Nearby nodes within snap_tolerance_meters are merged
+    - This handles slight coordinate mismatches in the source data
+    - Uses geodesic distance for accuracy
+
+Phase 4: Graph Building
+    - Create nodes with (x, y) coordinates
+    - Create edges between consecutive nodes along each LineString
+
+Phase 5: Weight Calculation
+    - Edge weights are geodesic distances (WGS84 ellipsoid)
+    - More accurate than Euclidean distance, especially over longer segments
+
+=== COORDINATE SYSTEMS ===
+
+The builder expects WGS84 (EPSG:4326) coordinates and will reproject if needed.
+Edge weights are always in METERS regardless of input CRS.
+
+=== DEVELOPER NOTES ===
+
+- Node IDs are integers starting from 0
+- Node attributes: 'x' (longitude), 'y' (latitude)
+- Edge attributes: 'weight' (meters), 'geometry' (LineString)
+- The graph is undirected (roads are bidirectional)
+"""
 
 from collections import defaultdict
 from typing import Optional

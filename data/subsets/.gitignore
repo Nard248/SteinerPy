@@ -1,5 +1,0 @@
-# Exclude generated data files (can be regenerated)
-*.gpkg
-
-# But keep README files
-!README.md
