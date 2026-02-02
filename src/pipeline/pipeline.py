@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import time
+import math
 import json
 
 import geopandas as gpd
@@ -39,9 +40,12 @@ import networkx as nx
 import numpy as np
 from scipy.spatial import cKDTree
 from pyproj import Geod
+from shapely.geometry import Point, LineString
+from shapely.strtree import STRtree
 
 from ..data.graph_builder import GraphBuilder
 from ..algorithms.base import AlgorithmRegistry, AlgorithmResult
+from ..graph_cache.graph_cache import GraphCache
 
 
 @dataclass
@@ -236,15 +240,30 @@ class SteinerPipeline:
         Raises:
             ValueError: If no road data is loaded.
         """
+
+        cache = GraphCache()
+
+        graph, report = cache.get_or_build(
+            roads_gdf=self._state.roads,
+            builder=self._graph_builder
+        )
+
+        self._state.graph = graph
+        self._state.graph_report = report
+
         if not self._state.data_loaded:
             raise ValueError("No data loaded. Call load_data() first.")
 
         start = time.perf_counter()
         print(f"\n[Stage 2] Building graph...")
 
-        self._state.graph, self._state.graph_report = self._graph_builder.build_and_validate(
-            self._state.roads
+        cache = GraphCache()
+
+        self._state.graph, self._state.graph_report = cache.get_or_build(
+            roads_gdf=self._state.roads,
+            builder=self._graph_builder,
         )
+
 
         self._state.build_time = time.perf_counter() - start
         self._state.graph_built = True
@@ -270,69 +289,101 @@ class SteinerPipeline:
         max_distance_meters: Optional[float] = None
     ) -> "SteinerPipeline":
         """
-        Map location points to nearest graph nodes (snap points).
+        Map location points to nearest road edges, then snap to nearest endpoint node.
 
-        Uses a KD-tree for efficient nearest neighbor queries.
-
-        Args:
-            max_distance_meters: Maximum snap distance in meters.
-                                 Defaults to config.max_snap_distance_meters.
-
-        Returns:
-            Self for method chaining.
-
-        Raises:
-            ValueError: If graph not built.
+        This version is Shapely 2.x safe and avoids graph fragmentation
+        caused by node-only snapping.
         """
         if not self._state.graph_built:
             raise ValueError("Graph not built. Call build_graph() first.")
 
+        from shapely.geometry import Point
+        from shapely.strtree import STRtree
+
         max_dist = max_distance_meters or self.config.max_snap_distance_meters
 
         start = time.perf_counter()
-        print(f"\n[Stage 3] Mapping terminals (max distance: {max_dist}m)...")
+        print(f"\n[Stage 3] Mapping terminals (edge snapping, max distance: {max_dist}m)...")
 
         graph = self._state.graph
 
-        # Build coordinate arrays for KD-tree
-        node_coords = {
-            n: (graph.nodes[n]['x'], graph.nodes[n]['y'])
-            for n in graph.nodes() if 'x' in graph.nodes[n]
-        }
-        node_ids = list(node_coords.keys())
-        coords_array = np.array([node_coords[n] for n in node_ids])
-        tree = cKDTree(coords_array)
+        # ------------------------------------------------------------------
+        # Build spatial index over edge geometries
+        # ------------------------------------------------------------------
+        edge_geoms = []
+        edge_nodes = []  # (u, v) per geometry
 
-        # Convert meters to approximate degrees (varies by latitude)
-        # Using conservative estimate: 1 degree ~ 111km at equator
-        max_dist_deg = max_dist / 111000.0
+        for u, v, data in graph.edges(data=True):
+            geom = data.get("geometry")
+            if geom is None:
+                continue
+            edge_geoms.append(geom)
+            edge_nodes.append((u, v))
+
+        if not edge_geoms:
+            raise ValueError("Graph has no edge geometries; cannot snap terminals.")
+
+        tree = STRtree(edge_geoms)
 
         self._state.location_to_node = {}
         self._state.terminals = set()
 
         snapped = 0
-        too_far = 0
+        skipped = 0
 
+        # ------------------------------------------------------------------
+        # Snap each location
+        # ------------------------------------------------------------------
         for idx, row in self._state.locations.iterrows():
             if row.geometry is None:
+                skipped += 1
                 continue
 
-            loc_coord = (row.geometry.x, row.geometry.y)
-            dist, nearest_idx = tree.query(loc_coord)
+            pt = row.geometry
 
-            if dist <= max_dist_deg:
-                node_id = node_ids[nearest_idx]
-                self._state.location_to_node[idx] = node_id
-                self._state.terminals.add(node_id)
-                snapped += 1
-            else:
-                too_far += 1
+            # STRtree.query returns INDICES in Shapely >= 2.0
+            candidate_idxs = tree.query(pt.buffer(max_dist))
+
+            if len(candidate_idxs) == 0:
+                skipped += 1
+                continue
+
+            best_i = None
+            best_dist = float("inf")
+
+            for i in candidate_idxs:
+                geom = edge_geoms[int(i)]
+                d = geom.distance(pt)
+                if d < best_dist:
+                    best_dist = d
+                    best_i = int(i)
+
+            if best_i is None:
+                skipped += 1
+                continue
+
+            # Snap to nearest endpoint of the best edge
+            u, v = edge_nodes[best_i]
+
+            ux, uy = graph.nodes[u]["x"], graph.nodes[u]["y"]
+            vx, vy = graph.nodes[v]["x"], graph.nodes[v]["y"]
+
+            du = Point(ux, uy).distance(pt)
+            dv = Point(vx, vy).distance(pt)
+
+            node = u if du <= dv else v
+
+            self._state.location_to_node[idx] = node
+            self._state.terminals.add(node)
+            snapped += 1
 
         print(f"  Snapped: {snapped} locations -> {len(self._state.terminals)} unique nodes")
-        if too_far > 0:
-            print(f"  Skipped: {too_far} locations (too far from roads)")
+        if skipped > 0:
+            print(f"  Skipped: {skipped} locations (too far from roads)")
 
-        # Apply terminal limit if configured
+        # ------------------------------------------------------------------
+        # Optional terminal limiting
+        # ------------------------------------------------------------------
         if self.config.max_terminals and len(self._state.terminals) > self.config.max_terminals:
             import random
             random.seed(self.config.terminal_sample_seed)
