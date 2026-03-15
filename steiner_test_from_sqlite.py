@@ -62,7 +62,7 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # 1) Read locations (from test1.sqlite)
     # -------------------------------------------------------------------------
-    location_src = project_root / "data_examples" / "test1.sqlite"
+    location_src = project_root / "data_examples" /"test1"/ "test1 locations.sqlite"
     print(f"Loading locations from: {location_src}")
 
     locations = _read_geodataframe(location_src)
