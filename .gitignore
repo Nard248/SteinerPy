@@ -9,6 +9,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.parquet
 .Python
 build/
 develop-eggs/
@@ -82,7 +83,7 @@ env/
 *.geojson
 *.gdb/
 *.mdb
-*.sqlite
+# *.sqlite
 *.sqlite3
 *.kml
 *.kmz
