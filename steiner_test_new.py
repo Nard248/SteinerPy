@@ -7,24 +7,34 @@ from pathlib import Path
 from shapely.geometry import Point
 from src.pipeline.runner import SteinerRunner
 from steiner_aio.components.read_data import put_crs
+import shapely
 
-ACCOUNT_NAME = "webviewerstorage"
-CONTAINER_NAME = "state-road-graphs"
-STAT_TOKEN = "sp=r&st=2026-03-13T19:15:37Z&se=2026-03-14T03:30:37Z&spr=https&sv=2024-11-04&sr=c&sig=Qb6uTnmcF%2BS1KqzLKGDNX5VtUakaR9983axwsl35Dbg%3D"
-client = BlobServiceClient(account_url=f"https://{ACCOUNT_NAME}.blob.core.windows.net",
-                            credential=STAT_TOKEN)
 
-container = client.get_container_client(CONTAINER_NAME)
+# ACCOUNT_NAME = "webviewerstorage"
+# CONTAINER_NAME = "state-road-graphs"
+# STAT_TOKEN = "sp=r&st=2026-03-13T19:15:37Z&se=2026-03-14T03:30:37Z&spr=https&sv=2024-11-04&sr=c&sig=Qb6uTnmcF%2BS1KqzLKGDNX5VtUakaR9983axwsl35Dbg%3D"
+# client = BlobServiceClient(account_url=f"https://{ACCOUNT_NAME}.blob.core.windows.net",
+#                             credential=STAT_TOKEN)
 
-def read_blob_to_dataframe(blob_name):
-    blob_client = container.get_blob_client(blob_name)
-    blob_data = blob_client.download_blob().readall()
-    df = pd.read_parquet(io.BytesIO(blob_data))
-    return df
+# container = client.get_container_client(CONTAINER_NAME)
 
-# Read nodes and edges from Azure Blob
-nodes_df = read_blob_to_dataframe("nodes_NY.parquet")
-edges_df = read_blob_to_dataframe("edges_NY.parquet")
+# def read_blob_to_dataframe(blob_name):
+#     blob_client = container.get_blob_client(blob_name)
+#     blob_data = blob_client.download_blob().readall()
+#     df = pd.read_parquet(io.BytesIO(blob_data))
+#     return df
+
+# # Read nodes and edges from Azure Blob
+# nodes_df = read_blob_to_dataframe("nodes_NY.parquet")
+# edges_df = read_blob_to_dataframe("edges_NY.parquet")
+
+
+nodes_df = pd.read_parquet("nodes_NY.parquet")
+edges_df = pd.read_parquet("edges_NY.parquet")
+
+edges_df['geometry'] = edges_df['geometry'].apply(lambda x: shapely.from_wkb(x))
+
+
 
 print(f"Loaded {len(nodes_df)} nodes and {len(edges_df)} edges from blob.")
 
