@@ -115,8 +115,7 @@ Steps:
     cursor = conn.cursor()
 
     #checking whether, on how many locations user can run the steiner
-    cursor.execute(f"""SELECT  client from us_wiroidb_2_1_privileges_limits
-            """)
+    cursor.execute("SELECT client FROM us_wiroidb_2_1_privileges_limits")
     client_names = cursor.fetchall()
 
     if client_name not in list(pd.DataFrame(client_names,columns=['a'])["a"]):
@@ -137,9 +136,10 @@ Please double-check the spelling or contact our support team for assistance.""")
         
 
     #checking whether, on how many locations user can run the steiner
-    cursor.execute(f"""SELECT  steiner_aio_locations from us_wiroidb_2_1_privileges_limits
-               where client = '{client_name}'
-               """)
+    cursor.execute(
+        "SELECT steiner_aio_locations FROM us_wiroidb_2_1_privileges_limits WHERE client = %s",
+        (client_name,),
+    )
     
     number_of_locations_allowed = int(cursor.fetchone()[0])
 
@@ -180,10 +180,10 @@ WHERE ST_Contains(geom, ST_SetSRID(ST_GeomFromWKB(%s), 102008))
     result = cursor.fetchone()
 
     if result == None: #result None means that locations are not US
-        cursor.execute(f"""
-SELECT  steiner_canadian_access from us_wiroidb_2_1_privileges_features
-where client = '{client_name}'
-""")
+        cursor.execute(
+            "SELECT steiner_canadian_access FROM us_wiroidb_2_1_privileges_features WHERE client = %s",
+            (client_name,),
+        )
 
         canadian_road_access = cursor.fetchone()[0]
         if canadian_road_access == True:
@@ -217,11 +217,13 @@ for further assistance.""")
             
             dict_of_cilents[client_name] = client_name
 
-        cursor.execute(f"""
-SELECT {dict_of_cilents[client_name]}
-FROM us_wiroidb_2_1_privileges_states
-WHERE state_abbr = '{state_abbr}'
-""")
+        # Column name comes from a controlled whitelist dict so it is safe to
+        # interpolate; only the WHERE value is user-supplied and parameterized.
+        col = dict_of_cilents[client_name]
+        cursor.execute(
+            f"SELECT {col} FROM us_wiroidb_2_1_privileges_states WHERE state_abbr = %s",
+            (state_abbr,),
+        )
     
         state_allowed = cursor.fetchone()[0]
 

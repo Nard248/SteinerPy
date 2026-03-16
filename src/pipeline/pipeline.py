@@ -241,16 +241,6 @@ class SteinerPipeline:
             ValueError: If no road data is loaded.
         """
 
-        cache = GraphCache()
-
-        graph, report = cache.get_or_build(
-            roads_gdf=self._state.roads,
-            builder=self._graph_builder
-        )
-
-        self._state.graph = graph
-        self._state.graph_report = report
-
         if not self._state.data_loaded:
             raise ValueError("No data loaded. Call load_data() first.")
 
@@ -289,34 +279,78 @@ class SteinerPipeline:
         max_distance_meters: Optional[float] = None
     ) -> "SteinerPipeline":
         """
-        Map location points to nearest road edges, then snap to nearest endpoint node.
+        Map location points to road network nodes using edge projection and splitting.
 
-        This version is Shapely 2.x safe and avoids graph fragmentation
-        caused by node-only snapping.
+        Each location is projected onto its nearest road edge.  If the
+        projection falls within ENDPOINT_SNAP_M of an endpoint the existing
+        node is reused.  Otherwise the edge is split at the projection point,
+        inserting a new graph node on that specific edge.  This prevents
+        locations on parallel / loop roads (e.g. East Parkwood vs West
+        Parkwood) from collapsing onto shared intersection nodes and being
+        lost from the Steiner solution.
+
+        Multiple locations on the same edge are sorted by distance along the
+        line and processed in order so each split is applied to the correct
+        sub-segment.
         """
         if not self._state.graph_built:
             raise ValueError("Graph not built. Call build_graph() first.")
 
-        from shapely.geometry import Point
+        from collections import defaultdict
+        from shapely.geometry import LineString
+        from shapely.ops import substring
         from shapely.strtree import STRtree
 
-        max_dist = max_distance_meters or self.config.max_snap_distance_meters
+        max_dist_m = max_distance_meters or self.config.max_snap_distance_meters
+        # 2× loose degree buffer for STRtree pre-filter; Haversine is the
+        # true gatekeeper.
+        max_dist_deg = (max_dist_m / 111_000.0) * 2.0
+        # If a location projects within this many metres of an existing node,
+        # snap to that node rather than splitting the edge.
+        ENDPOINT_SNAP_M = 15.0
 
         start = time.perf_counter()
-        print(f"\n[Stage 3] Mapping terminals (edge snapping, max distance: {max_dist}m)...")
+        print(f"\n[Stage 3] Mapping terminals (edge-split snapping, max distance: {max_dist_m}m)...")
 
         graph = self._state.graph
 
+        def _haversine_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+            R = 6_371_000.0
+            phi1, phi2 = math.radians(lat1), math.radians(lat2)
+            dphi = math.radians(lat2 - lat1)
+            dlam = math.radians(lon2 - lon1)
+            a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+            return 2 * R * math.asin(math.sqrt(a))
+
         # ------------------------------------------------------------------
-        # Build spatial index over edge geometries
+        # Build spatial index over original edge geometries (snapshot).
+        # We capture original (u, v) pairs because edges may be split later.
         # ------------------------------------------------------------------
-        edge_geoms = []
-        edge_nodes = []  # (u, v) per geometry
+        edge_geoms: List = []
+        edge_nodes: List[Tuple[int, int]] = []
 
         for u, v, data in graph.edges(data=True):
             geom = data.get("geometry")
             if geom is None:
                 continue
+
+            # Normalize geometry direction to always run u → v.
+            # Road geometries are stored in whatever direction they appear in
+            # the source data, which may be v → u.  map_terminals relies on
+            # geom.project() measuring distance from u's end, so a reversed
+            # geometry would place split points at the wrong position and
+            # produce edge geometries whose start/end don't match their nodes.
+            coords = list(geom.coords)
+            if len(coords) >= 2:
+                ux, uy = graph.nodes[u]["x"], graph.nodes[u]["y"]
+                vx, vy = graph.nodes[v]["x"], graph.nodes[v]["y"]
+                dx_su = (coords[0][0] - ux) ** 2 + (coords[0][1] - uy) ** 2
+                dx_sv = (coords[0][0] - vx) ** 2 + (coords[0][1] - vy) ** 2
+                if dx_su > dx_sv:
+                    # Geometry starts closer to v — reverse it so it starts at u.
+                    geom = LineString(coords[::-1])
+                    data["geometry"] = geom   # update graph in-place
+
             edge_geoms.append(geom)
             edge_nodes.append((u, v))
 
@@ -325,73 +359,181 @@ class SteinerPipeline:
 
         tree = STRtree(edge_geoms)
 
-        self._state.location_to_node = {}
-        self._state.terminals = set()
-
-        snapped = 0
-        skipped = 0
-
         # ------------------------------------------------------------------
-        # Snap each location
+        # Phase 1 – project every location onto its nearest edge.
+        # proj_info[loc_idx] = (edge_i, along_abs, proj_pt, du, dv, dist_m)
+        #   along_abs  – distance along the original edge geometry (degrees)
+        #   proj_pt    – the projected Point on the edge
+        #   du / dv    – Haversine distance to each endpoint (metres)
+        #   dist_m     – Haversine distance from location to projection (metres)
         # ------------------------------------------------------------------
+        proj_info: Dict[Any, Tuple] = {}
+
         for idx, row in self._state.locations.iterrows():
             if row.geometry is None:
-                skipped += 1
                 continue
 
             pt = row.geometry
-
-            # STRtree.query returns INDICES in Shapely >= 2.0
-            candidate_idxs = tree.query(pt.buffer(max_dist))
-
+            candidate_idxs = tree.query(pt.buffer(max_dist_deg))
             if len(candidate_idxs) == 0:
-                skipped += 1
                 continue
 
-            best_i = None
-            best_dist = float("inf")
+            best_i: Optional[int] = None
+            best_dist_m = float("inf")
+            best_proj_pt = None
+            best_along = None
 
-            for i in candidate_idxs:
-                geom = edge_geoms[int(i)]
-                d = geom.distance(pt)
-                if d < best_dist:
-                    best_dist = d
-                    best_i = int(i)
+            for ci in candidate_idxs:
+                ci = int(ci)
+                geom = edge_geoms[ci]
+                along = geom.project(pt)          # distance along line (degrees)
+                pp = geom.interpolate(along)      # nearest point on edge
+                d = _haversine_m(pt.x, pt.y, pp.x, pp.y)
+                if d < best_dist_m:
+                    best_dist_m = d
+                    best_i = ci
+                    best_proj_pt = pp
+                    best_along = along
 
-            if best_i is None:
-                skipped += 1
+            if best_i is None or best_dist_m > max_dist_m:
                 continue
 
-            # Snap to nearest endpoint of the best edge
             u, v = edge_nodes[best_i]
+            du = _haversine_m(pt.x, pt.y, graph.nodes[u]["x"], graph.nodes[u]["y"])
+            dv = _haversine_m(pt.x, pt.y, graph.nodes[v]["x"], graph.nodes[v]["y"])
+            proj_info[idx] = (best_i, best_along, best_proj_pt, du, dv, best_dist_m)
 
-            ux, uy = graph.nodes[u]["x"], graph.nodes[u]["y"]
-            vx, vy = graph.nodes[v]["x"], graph.nodes[v]["y"]
+        # ------------------------------------------------------------------
+        # Phase 2 – group by edge, then split edges that need it.
+        #
+        # For each edge we sort all its projected locations by along_abs and
+        # walk from u toward v, splitting the *remaining* sub-edge at each
+        # projection point in turn.  This keeps the edge/node bookkeeping
+        # consistent when multiple locations land on the same segment.
+        # ------------------------------------------------------------------
+        edge_to_locs: Dict[int, List] = defaultdict(list)
+        for idx, (ei, along, pp, du, dv, dm) in proj_info.items():
+            edge_to_locs[ei].append((along, idx, pp, du, dv))
 
-            du = Point(ux, uy).distance(pt)
-            dv = Point(vx, vy).distance(pt)
+        location_to_node: Dict[Any, int] = {}
+        terminals: Set[int] = set()
+        next_nid: int = (max(graph.nodes()) + 1) if graph.number_of_nodes() > 0 else 0
 
-            node = u if du <= dv else v
+        for ei, locs in edge_to_locs.items():
+            u_orig, v_orig = edge_nodes[ei]
+            orig_geom = edge_geoms[ei]
+            orig_len = orig_geom.length          # in degrees (WGS-84)
 
-            self._state.location_to_node[idx] = node
-            self._state.terminals.add(node)
-            snapped += 1
+            if not graph.has_edge(u_orig, v_orig):
+                # Edge was already removed (shouldn't happen, but be safe).
+                for _, idx, _, du, dv, _ in locs:
+                    node = u_orig if du <= dv else v_orig
+                    location_to_node[idx] = node
+                    terminals.add(node)
+                continue
 
-        print(f"  Snapped: {snapped} locations -> {len(self._state.terminals)} unique nodes")
+            orig_edge_data = dict(graph.edges[u_orig, v_orig])
+            orig_weight = orig_edge_data.get("weight", 0.0)
+
+            # Sort by absolute distance along the original edge.
+            locs_sorted = sorted(locs, key=lambda x: x[0])
+
+            # Walking state: cur_u is the "head" node, cur_offset is where it
+            # sits on the original edge geometry (in degrees).
+            cur_u = u_orig
+            cur_offset = 0.0        # distance from u_orig to cur_u along orig_geom
+
+            for along, idx, proj_pt, du, dv in locs_sorted:
+                # ── endpoint snap ──────────────────────────────────────────
+                if du <= ENDPOINT_SNAP_M:
+                    node = u_orig
+                elif dv <= ENDPOINT_SNAP_M:
+                    node = v_orig
+                else:
+                    # ── interior split ─────────────────────────────────────
+                    if not graph.has_edge(cur_u, v_orig):
+                        # Safety fallback.
+                        node = cur_u
+                    else:
+                        # Sub-geometry from cur_u to v_orig.
+                        sub_geom = substring(orig_geom, cur_offset, orig_len)
+                        # Distance of split point from cur_u along sub_geom.
+                        rel_along = along - cur_offset
+
+                        if sub_geom.length <= 1e-10 or rel_along <= 0:
+                            node = cur_u
+                        else:
+                            # Weight of the remaining cur_u→v_orig sub-edge.
+                            remaining_frac = (
+                                (orig_len - cur_offset) / orig_len
+                                if orig_len > 0 else 1.0
+                            )
+                            cur_weight = orig_weight * remaining_frac
+                            split_frac = rel_along / sub_geom.length
+
+                            # New node at projection point.
+                            nid = next_nid
+                            next_nid += 1
+                            graph.add_node(nid, x=proj_pt.x, y=proj_pt.y)
+
+                            # Split sub-geometry.
+                            try:
+                                geom_head = substring(sub_geom, 0, rel_along)
+                                geom_tail = substring(sub_geom, rel_along, sub_geom.length)
+                            except Exception:
+                                geom_head = LineString([
+                                    (graph.nodes[cur_u]["x"], graph.nodes[cur_u]["y"]),
+                                    (proj_pt.x, proj_pt.y),
+                                ])
+                                geom_tail = LineString([
+                                    (proj_pt.x, proj_pt.y),
+                                    (graph.nodes[v_orig]["x"], graph.nodes[v_orig]["y"]),
+                                ])
+
+                            w_head = max(cur_weight * split_frac, 1e-9)
+                            w_tail = max(cur_weight * (1.0 - split_frac), 1e-9)
+
+                            graph.remove_edge(cur_u, v_orig)
+
+                            d_head = orig_edge_data.copy()
+                            d_head["weight"] = w_head
+                            d_head["geometry"] = geom_head
+                            graph.add_edge(cur_u, nid, **d_head)
+
+                            d_tail = orig_edge_data.copy()
+                            d_tail["weight"] = w_tail
+                            d_tail["geometry"] = geom_tail
+                            graph.add_edge(nid, v_orig, **d_tail)
+
+                            node = nid
+
+                            # Advance walking state to the new node.
+                            cur_u = nid
+                            cur_offset = along
+
+                location_to_node[idx] = node
+                terminals.add(node)
+
+        snapped = len(location_to_node)
+        skipped = len(self._state.locations) - snapped
+
+        print(f"  Snapped: {snapped} locations -> {len(terminals)} unique terminals")
         if skipped > 0:
             print(f"  Skipped: {skipped} locations (too far from roads)")
 
         # ------------------------------------------------------------------
         # Optional terminal limiting
         # ------------------------------------------------------------------
-        if self.config.max_terminals and len(self._state.terminals) > self.config.max_terminals:
+        if self.config.max_terminals and len(terminals) > self.config.max_terminals:
             import random
             random.seed(self.config.terminal_sample_seed)
-            self._state.terminals = set(
-                random.sample(list(self._state.terminals), self.config.max_terminals)
+            terminals = set(
+                random.sample(list(terminals), self.config.max_terminals)
             )
-            print(f"  Limited to {len(self._state.terminals)} terminals (config.max_terminals)")
+            print(f"  Limited to {len(terminals)} terminals (config.max_terminals)")
 
+        self._state.location_to_node = location_to_node
+        self._state.terminals = terminals
         self._state.map_time = time.perf_counter() - start
         self._state.terminals_mapped = True
         print(f"  Mapped in {self._state.map_time:.3f}s")

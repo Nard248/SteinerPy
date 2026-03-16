@@ -23,14 +23,14 @@ class PrunedDijkstraSteiner(SteinerAlgorithm):
     is_exact = False
 
     def __init__(self, early_termination: bool = True, **kwargs):
-        super().__init__(**kwargs)
-        self.early_termination = early_termination
-
-        # Quality knobs
+        # Extract algorithm-specific knobs BEFORE passing to the base class so
+        # they don't pollute self.params with implementation-internal keys.
         self.epsilon = float(kwargs.pop("epsilon", 0.15))
         self.hub_threshold = int(kwargs.pop("hub_threshold", 3))
         self.max_hubs = int(kwargs.pop("max_hubs", 50))
         self.hub_bonus = float(kwargs.pop("hub_bonus", 0.0))
+        super().__init__(**kwargs)
+        self.early_termination = early_termination
 
     def solve(self, graph: nx.Graph, terminals: Set[int], **kwargs) -> AlgorithmResult:
         start_time = time.perf_counter()
@@ -280,7 +280,7 @@ class PrunedDijkstraSteiner(SteinerAlgorithm):
             total_weight=self._compute_total_weight(steiner_graph),
             execution_time=time.perf_counter() - start_time,
             algorithm_name=self.name,
-            is_connected=False,  # forest, not a single tree
+            is_connected=self._check_connectivity(steiner_graph, terminals),
             metadata={
                 "per_component": per_comp_stats,
                 "isolated_terminals": list(isolated_terminals),
@@ -292,12 +292,23 @@ class PrunedDijkstraSteiner(SteinerAlgorithm):
         )
 
     def _prune_leaves(self, graph: nx.Graph, terminals: Set[int]) -> nx.Graph:
+        from collections import deque
         graph = graph.copy()
-        changed = True
-        while changed:
-            changed = False
-            for node in list(graph.nodes()):
-                if graph.degree(node) == 1 and node not in terminals:
-                    graph.remove_node(node)
-                    changed = True
+        # Seed the queue with every non-terminal leaf.
+        # Each removal may expose a new leaf — process it immediately rather
+        # than rescanning the whole graph (avoids O(n²) repeated passes).
+        q: deque = deque(
+            n for n in graph.nodes() if graph.degree(n) == 1 and n not in terminals
+        )
+        while q:
+            node = q.popleft()
+            if node not in graph:
+                continue
+            if graph.degree(node) != 1 or node in terminals:
+                continue
+            neighbors = list(graph.neighbors(node))
+            graph.remove_node(node)
+            for nb in neighbors:
+                if nb in graph and graph.degree(nb) == 1 and nb not in terminals:
+                    q.append(nb)
         return graph

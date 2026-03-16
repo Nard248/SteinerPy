@@ -94,35 +94,29 @@ class SteinerRunner:
         if self._locations is None:
             raise ValueError("No location data loaded.")
 
-        print("Mapping locations to graph nodes...")
-        node_coords = {n: (self._graph.nodes[n]['x'], self._graph.nodes[n]['y'])
-                       for n in self._graph.nodes() if 'x' in self._graph.nodes[n]}
+        # Delegate to SteinerPipeline which uses edge-splitting so locations on
+        # parallel / loop roads (e.g. East vs West Parkwood) get unique nodes
+        # on their own street instead of collapsing onto shared junctions.
+        from .pipeline import SteinerPipeline, PipelineConfig
 
-        node_ids = list(node_coords.keys())
-        coords_array = np.array([node_coords[n] for n in node_ids])
-        tree = cKDTree(coords_array)
+        pipe = SteinerPipeline(PipelineConfig(
+            max_snap_distance_meters=max_distance_meters,
+            max_terminals=self.config.max_terminals,
+            terminal_sample_seed=self.config.terminal_sample_seed,
+        ))
+        # Inject already-built state so the pipeline skips load/build stages.
+        pipe._state.roads = self._roads
+        pipe._state.locations = self._locations
+        pipe._state.graph = self._graph
+        pipe._state.data_loaded = True
+        pipe._state.graph_built = True
 
-        self._location_to_node = {}
-        self._terminals = set()
-        max_dist_deg = max_distance_meters / 111000
+        pipe.map_terminals(max_distance_meters)
 
-        for idx, row in self._locations.iterrows():
-            if row.geometry is None:
-                continue
-            loc_coord = (row.geometry.x, row.geometry.y)
-            dist, nearest_idx = tree.query(loc_coord)
-            if dist <= max_dist_deg:
-                node_id = node_ids[nearest_idx]
-                self._location_to_node[idx] = node_id
-                self._terminals.add(node_id)
-
-        print(f"  Mapped {len(self._location_to_node)} locations to {len(self._terminals)} unique nodes")
-
-        if self.config.max_terminals and len(self._terminals) > self.config.max_terminals:
-            import random
-            random.seed(self.config.terminal_sample_seed)
-            self._terminals = set(random.sample(list(self._terminals), self.config.max_terminals))
-            print(f"  Limited to {len(self._terminals)} terminals")
+        # Pull back the (possibly split-extended) graph and mappings.
+        self._graph = pipe._state.graph
+        self._terminals = pipe._state.terminals
+        self._location_to_node = pipe._state.location_to_node
         return self
 
     def set_terminals(self, terminals: Set[int]) -> "SteinerRunner":

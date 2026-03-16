@@ -56,6 +56,7 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 from pyproj import Geod
+from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString, Point
 
 
@@ -129,36 +130,6 @@ class GraphBuilder:
             return list(geometry.geoms)
         return []
 
-    def _snap_to_existing(
-        self,
-        coord: tuple[float, float],
-        existing_nodes: dict[tuple[float, float], int],
-        tolerance_degrees: float,
-    ) -> Optional[tuple[float, float]]:
-        """
-        Find if there's an existing node within snap tolerance.
-
-        Args:
-            coord: The coordinate to check.
-            existing_nodes: Dict mapping coordinates to node IDs.
-            tolerance_degrees: Approximate tolerance in degrees.
-
-        Returns:
-            The existing coordinate if within tolerance, None otherwise.
-        """
-        for existing_coord in existing_nodes:
-            dx = abs(coord[0] - existing_coord[0])
-            dy = abs(coord[1] - existing_coord[1])
-            # Quick check using Chebyshev distance in degrees
-            if dx <= tolerance_degrees and dy <= tolerance_degrees:
-                # Verify with actual geodesic distance
-                dist = self._geodesic_distance(
-                    coord[0], coord[1], existing_coord[0], existing_coord[1]
-                )
-                if dist <= self.snap_tolerance_meters:
-                    return existing_coord
-        return None
-
     def build_graph(self, roads: gpd.GeoDataFrame) -> nx.Graph:
         """
         Convert road GeoDataFrame to NetworkX graph.
@@ -227,20 +198,48 @@ class GraphBuilder:
                 node_coords.add(coord)
 
         # Phase 3: Apply snapping to merge nearby nodes
-        coord_to_node = {}
-        node_id = 0
-
-        # Sort for deterministic ordering
+        # O(N log N) using KDTree + union-find instead of the old O(N²) loop.
         sorted_coords = sorted(node_coords)
+        n = len(sorted_coords)
 
-        for coord in sorted_coords:
-            snapped = self._snap_to_existing(coord, coord_to_node, tolerance_degrees)
-            if snapped is not None:
-                # Map this coord to the existing node's coord
-                coord_to_node[coord] = coord_to_node[snapped]
-            else:
-                coord_to_node[coord] = node_id
-                node_id += 1
+        coord_to_node: dict[tuple, int] = {}
+
+        if n == 0:
+            pass  # nothing to do
+        else:
+            coords_arr = np.array(sorted_coords, dtype=np.float64)  # (N, 2)
+            tree = cKDTree(coords_arr)
+
+            # Union-Find (path-compressed)
+            parent = list(range(n))
+
+            def _find(x: int) -> int:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            # Candidate pairs within the cheap degree bounding box
+            candidate_pairs = tree.query_pairs(tolerance_degrees)
+
+            for i, j in candidate_pairs:
+                ci = sorted_coords[i]
+                cj = sorted_coords[j]
+                dist = self._geodesic_distance(ci[0], ci[1], cj[0], cj[1])
+                if dist <= self.snap_tolerance_meters:
+                    ri, rj = _find(i), _find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+
+            # Assign integer node IDs: each union root gets a unique ID
+            root_to_id: dict[int, int] = {}
+            node_id = 0
+            for i, coord in enumerate(sorted_coords):
+                root = _find(i)
+                if root not in root_to_id:
+                    root_to_id[root] = node_id
+                    node_id += 1
+                coord_to_node[coord] = root_to_id[root]
 
         # Phase 4: Build the graph
         G = nx.Graph()
@@ -254,7 +253,54 @@ class GraphBuilder:
         for nid, coord in node_coords_by_id.items():
             G.add_node(nid, x=coord[0], y=coord[1])
 
+        # Virtual node IDs start after all real nodes so they never collide.
+        next_vnode_id = node_id  # node_id was the counter from Phase 3
+
         # Phase 5: Create edges from LineStrings
+        from shapely.ops import substring as _substring
+
+        # Track existing edge weights for deduplication:
+        #   edge_weights[(min_node, max_node)] = set of lengths already added
+        # Two edges are considered exact duplicates when their lengths differ by
+        # less than 1 %.  Exact duplicates arise when the DB returns the same
+        # road segment under multiple road_type codes.
+        edge_weights: dict[tuple[int, int], set[float]] = {}
+
+        def _is_duplicate(key: tuple[int, int], new_weight: float) -> bool:
+            """Return True if an edge with essentially the same length exists."""
+            for w in edge_weights.get(key, ()):
+                if max(w, new_weight) > 0 and abs(new_weight - w) / max(w, new_weight) < 0.01:
+                    return True
+            return False
+
+        def _register_weight(key: tuple[int, int], weight: float) -> None:
+            edge_weights.setdefault(key, set()).add(weight)
+
+        def _add_virtual_split(
+            from_n: int, to_n: int, weight: float, edge_geom: LineString
+        ) -> None:
+            """Insert a midpoint virtual node to keep a parallel road in the graph."""
+            nonlocal next_vnode_id
+            mid_pt = edge_geom.interpolate(0.5, normalized=True)
+            vnode_id = next_vnode_id
+            next_vnode_id += 1
+            G.add_node(vnode_id, x=mid_pt.x, y=mid_pt.y)
+            try:
+                geom_head = _substring(edge_geom, 0.0, 0.5, normalized=True)
+                geom_tail = _substring(edge_geom, 0.5, 1.0, normalized=True)
+            except Exception:
+                cx, cy = mid_pt.x, mid_pt.y
+                geom_head = LineString([edge_geom.coords[0], (cx, cy)])
+                geom_tail = LineString([(cx, cy), edge_geom.coords[-1]])
+            G.add_edge(from_n, vnode_id, weight=weight / 2.0, geometry=geom_head)
+            G.add_edge(vnode_id, to_n,   weight=weight / 2.0, geometry=geom_tail)
+            # Register both half-weights so a third copy of the same road is
+            # also recognised as a duplicate.
+            hk1 = (min(from_n, vnode_id), max(from_n, vnode_id))
+            hk2 = (min(vnode_id, to_n),   max(vnode_id, to_n))
+            _register_weight(hk1, weight / 2.0)
+            _register_weight(hk2, weight / 2.0)
+
         for ls in all_linestrings:
             coords = list(ls.coords)
             if len(coords) < 2:
@@ -271,30 +317,35 @@ class GraphBuilder:
                 # Check if this is a node point
                 if rounded in coord_to_node:
                     if current_node_coord is not None and len(segment_coords) >= 2:
-                        # Create edge from current_node to this node
                         from_node = coord_to_node[current_node_coord]
-                        to_node = coord_to_node[rounded]
+                        to_node   = coord_to_node[rounded]
+                        weight    = self._line_length_meters(segment_coords)
+                        edge_geom = LineString(segment_coords)
+                        key       = (min(from_node, to_node), max(from_node, to_node))
 
-                        if from_node != to_node:
-                            # Calculate weight as geodesic distance
-                            weight = self._line_length_meters(segment_coords)
+                        if from_node == to_node:
+                            # Self-loop: a cul-de-sac or ring road whose endpoints
+                            # both snapped to the same junction.  Inserting a
+                            # virtual midpoint node lets the segment stay in the
+                            # graph so terminals on it can be mapped correctly.
+                            _add_virtual_split(from_node, to_node, weight, edge_geom)
 
-                            # Create edge geometry
-                            edge_geom = LineString(segment_coords)
+                        elif _is_duplicate(key, weight):
+                            # Exact duplicate from DB (same road returned twice
+                            # under different road_type codes) — skip silently.
+                            pass
 
-                            # Add or update edge (keep shorter if duplicate)
-                            if G.has_edge(from_node, to_node):
-                                existing_weight = G[from_node][to_node]["weight"]
-                                if weight < existing_weight:
-                                    G[from_node][to_node]["weight"] = weight
-                                    G[from_node][to_node]["geometry"] = edge_geom
-                            else:
-                                G.add_edge(
-                                    from_node,
-                                    to_node,
-                                    weight=weight,
-                                    geometry=edge_geom,
-                                )
+                        elif G.has_edge(from_node, to_node):
+                            # True parallel road (different geometry / length)
+                            # between the same two junctions (e.g. East Parkwood
+                            # and West Parkwood).  Keep it via a virtual split.
+                            _register_weight(key, weight)
+                            _add_virtual_split(from_node, to_node, weight, edge_geom)
+
+                        else:
+                            G.add_edge(from_node, to_node,
+                                       weight=weight, geometry=edge_geom)
+                            _register_weight(key, weight)
 
                     # Start new segment from this node
                     current_node_coord = rounded

@@ -439,28 +439,40 @@ def drop_lengths(points,snap):
 
 
        
-def create_polygon(points,buffer_distance):
+def create_polygon(points, buffer_distance):
         """
-        Create a polygon from the buffered points.
+        Create a polygon from the buffered convex hull of all points.
+
+        Buffering individual points only covers a 1000m radius around each
+        location; roads that run *between* far-apart locations are missed.
+        Buffering the convex hull ensures the entire corridor between all
+        locations is included in the road-network query.
         """
         done = False
-        while done !=True: 
+        while done != True:
             try:
+                # Convex hull covers the space between all locations, not just
+                # circles around each one.  For a single point it degenerates to
+                # a point, for two points to a line — buffer() makes both into a
+                # valid polygon regardless.
+                hull = points.unary_union.convex_hull
+                buffered_geom = hull.buffer(buffer_distance)
 
-                polygon = gpd.GeoDataFrame({"geometry" :points.buffer(buffer_distance).unary_union},
-                                       crs= "ESRI:102008",index=[0])
-                
+                polygon = gpd.GeoDataFrame(
+                    {"geometry": [buffered_geom]},
+                    crs="ESRI:102008",
+                    index=[0],
+                )
                 polygon = polygon.to_crs("EPSG:4326")
-                x,y = polygon.geometry[0].exterior.xy
+                x, y = polygon.geometry[0].exterior.xy
                 done = True
 
             except Exception:
-                buffer_distance+=500
-        
-        if not isinstance(polygon.geometry[0], shapely.geometry.polygon.Polygon):
+                buffer_distance += 500
 
+        if not isinstance(polygon.geometry[0], shapely.geometry.polygon.Polygon):
             raise ValueError("Cannot create polygon from point data.")
-        
+
         return polygon
 
 

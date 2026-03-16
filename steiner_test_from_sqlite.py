@@ -95,6 +95,7 @@ def main() -> None:
     
     locations = locations.to_crs("EPSG:4326")
     roads = roads.to_crs("EPSG:4326")
+    roads.to_file(results_dir / "queried_roads.gpkg", layer="roads", driver="GPKG")
 
     # -------------------------------------------------------------------------
     # 3) Run Steiner algorithm and export

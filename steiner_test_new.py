@@ -51,16 +51,16 @@ print(f"Loaded {len(locations)} locations.")
 
 # locations = locations.to_crs("EPSG:4326")
 # locations = put_crs(locations,"")
-# Create a buffer around locations (e.g., 1 km)
+# Buffer the convex hull of all locations so the corridor *between* far-apart
+# locations is covered, not just individual 1000 m circles around each one.
 buffer_distance = 1000  # meters
 locations = locations.set_crs("EPSG:4326")
-locations_projected = locations.to_crs("ESRI:102008")  # Web Mercator for buffering
-buffered = locations_projected.buffer(buffer_distance)
-buffered_union = buffered.unary_union
+locations_projected = locations.to_crs("ESRI:102008")
+hull = locations_projected.unary_union.convex_hull
+buffered_union = hull.buffer(buffer_distance)
 
 # Filter nodes within the buffer
 nodes_gdf = gpd.GeoDataFrame(nodes_df, geometry=[Point(xy) for xy in zip(nodes_df.x, nodes_df.y)], crs="ESRI:102008")
-#nodes_projected = nodes_gdf.to_crs("EPSG:3857")
 nodes_filtered = nodes_gdf[nodes_gdf.geometry.within(buffered_union)]
 
 nodes_filtered = nodes_filtered.to_crs("EPSG:4326")
